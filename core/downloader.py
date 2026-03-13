@@ -1,14 +1,15 @@
 """
 Video Downloader
 ================
-Uses yt-dlp with js_runtimes (node) to extract direct download URLs
-without requiring cookies or bot detection workarounds.
+Uses the prexzy API (https://apis.prexzyvilla.site/download/aio?url=...)
+to get direct stream URLs — no yt-dlp, no bot detection issues.
 
-Extracts best muxed MP4 (video+audio) and best audio-only stream,
-then downloads directly via aiohttp.
-
-For higher qualities (720p/1080p) that are video-only, merges with
-audio via ffmpeg.
+Strategy:
+- prexzy returns a list of media entries (type, url, quality).
+- quality string format: "mp4 (720p)", "m4a (133kb/s)", "opus (158kb/s)"
+- itag=18 / "mp4 (360p)" with ratebypass=yes is muxed (video+audio).
+- All other video entries are video-only → must merge with best audio via ffmpeg.
+- Prefer mp4 over webm for video, m4a over opus for audio.
 """
 
 import asyncio
@@ -20,9 +21,14 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
 import aiohttp
+import requests
 
 logger = logging.getLogger(__name__)
 
+PREXZY_API = "https://apis.prexzyvilla.site/download/aio"
+
+
+# ── Data classes ────────────────────────────────────────────────────────────
 
 @dataclass
 class VideoInfo:
@@ -58,35 +64,114 @@ class VideoInfo:
         return f"{m}:{s:02d}"
 
 
-# yt-dlp format selectors per quality preset
-QUALITY_FORMATS: Dict[str, str] = {
-    "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]",
-    "144p":  "bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=144]+bestaudio/best[height<=144]",
-    "worst": "worstvideo+worstaudio/worst",
-    "audio": "bestaudio[ext=m4a]/bestaudio",
-}
+# ── prexzy API helpers ──────────────────────────────────────────────────────
 
-YDL_OPTS_BASE = {
-    "quiet": True,
-    "skip_download": True,
-    "noplaylist": True,
-    "ignoreerrors": True,
-    "js_runtimes": {
-        "node": {}
-    },
-}
+def _extract_video_id(url: str) -> Optional[str]:
+    """Extract YouTube video ID from a URL."""
+    patterns = [
+        r"youtu\.be/([^?&/#]+)",
+        r"youtube\.com/watch\?.*v=([^&/#]+)",
+        r"youtube\.com/embed/([^?&/#]+)",
+        r"youtube\.com/shorts/([^?&/#]+)",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
 
+
+def _fetch_prexzy(url: str) -> dict:
+    """Call prexzy API and return the parsed JSON response."""
+    resp = requests.get(PREXZY_API, params={"url": url}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("status"):
+        raise RuntimeError(f"prexzy API error: {data}")
+    return data
+
+
+def _parse_height(quality_str: str) -> int:
+    """'mp4 (720p)' → 720, 'm4a (133kb/s)' → 0"""
+    m = re.search(r'\((\d+)p\)', quality_str)
+    return int(m.group(1)) if m else 0
+
+
+def _parse_bitrate(quality_str: str) -> int:
+    """'m4a (133kb/s)' → 133, 'opus (158kb/s)' → 158"""
+    m = re.search(r'\((\d+)kb/s\)', quality_str)
+    return int(m.group(1)) if m else 0
+
+
+def _is_muxed(video_url: str) -> bool:
+    """itag=18 muxed streams have ratebypass=yes in their URL."""
+    return "ratebypass=yes" in video_url
+
+
+def _select_video(medias: list, quality_preset: str) -> Optional[dict]:
+    """
+    Pick the best video-type entry for the requested quality.
+    Prefers mp4 over webm. Selects highest height <= target.
+    """
+    videos = [m for m in medias if m.get("type") == "video"]
+
+    # Separate by ext: prefer mp4
+    mp4s = [v for v in videos if v["quality"].startswith("mp4")]
+    webms = [v for v in videos if v["quality"].startswith("webm")]
+    ordered = mp4s if mp4s else webms
+
+    if not ordered:
+        return None
+
+    # Attach parsed height
+    for v in ordered:
+        v["_height"] = _parse_height(v["quality"])
+
+    if quality_preset == "best":
+        return max(ordered, key=lambda x: x["_height"])
+
+    if quality_preset == "audio":
+        return None  # audio-only, no video needed
+
+    if quality_preset == "worst":
+        return min(ordered, key=lambda x: x["_height"])
+
+    # Numeric quality: "720p" → 720
+    target = int(quality_preset.replace("p", ""))
+    # Pick highest mp4 that is <= target
+    candidates = [v for v in ordered if v["_height"] <= target]
+    if candidates:
+        return max(candidates, key=lambda x: x["_height"])
+    # If nothing fits below target, return lowest available
+    return min(ordered, key=lambda x: x["_height"])
+
+
+def _select_audio(medias: list) -> Optional[dict]:
+    """
+    Pick the best audio-type entry.
+    Prefers m4a over opus, then highest bitrate.
+    """
+    audios = [m for m in medias if m.get("type") == "audio"]
+    if not audios:
+        return None
+
+    m4as = [a for a in audios if a["quality"].startswith("m4a")]
+    opuses = [a for a in audios if a["quality"].startswith("opus")]
+    ordered = m4as if m4as else opuses
+
+    for a in ordered:
+        a["_bitrate"] = _parse_bitrate(a["quality"])
+
+    return max(ordered, key=lambda x: x["_bitrate"])
+
+
+# ── Main downloader class ───────────────────────────────────────────────────
 
 class YouTubeDownloader:
     """
-    Download videos using yt-dlp (js_runtimes/node) for URL extraction,
-    then streams the file directly via aiohttp.
+    Download videos via prexzy API (no yt-dlp, no bot detection).
 
-    Quality presets: best, 1080p, 720p, 480p, 360p, 144p, worst, audio
+    Quality presets: best, 1080p, 720p, 480p, 360p, 240p, 144p, audio
     """
 
     def __init__(
@@ -99,163 +184,70 @@ class YouTubeDownloader:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.max_filesize_mb = max_filesize_mb
 
-    # ── URL extraction via yt-dlp ───────────────────────────────────────────
-
-    def _extract_info(self, url: str, fmt: Optional[str] = None) -> dict:
-        """Run yt-dlp extraction synchronously (called via executor)."""
-        import yt_dlp
-        opts = dict(YDL_OPTS_BASE)
-        if fmt:
-            opts["format"] = fmt
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise RuntimeError("yt-dlp returned no info for this URL")
-            return info
-
-    def _get_direct_links(self, url: str) -> dict:
-        """
-        Extract best muxed MP4 and best audio URL using the exact
-        logic from the reference implementation.
-        """
-        import yt_dlp
-        opts = dict(YDL_OPTS_BASE)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise RuntimeError("Failed to extract video info")
-
-            formats = info.get("formats", [])
-            best_mp4 = None
-            best_audio = None
-
-            for f in formats:
-                # Best muxed MP4 (video + audio)
-                if (
-                    f.get("ext") == "mp4"
-                    and f.get("vcodec") != "none"
-                    and f.get("acodec") != "none"
-                ):
-                    best_mp4 = f
-
-                # Best audio-only
-                if f.get("vcodec") == "none" and f.get("acodec") != "none":
-                    best_audio = f
-
-            return {
-                "info": info,
-                "best_mp4": best_mp4,
-                "best_audio": best_audio,
-            }
-
-    def _get_links_for_quality(self, url: str, quality: str) -> dict:
-        """
-        Extract video + audio URLs for a specific quality.
-        For higher qualities (720p+) yt-dlp returns separate video/audio streams.
-        """
-        import yt_dlp
-        fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["720p"])
-        opts = dict(YDL_OPTS_BASE)
-        opts["format"] = fmt
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise RuntimeError("Failed to extract video info")
-
-            formats = info.get("formats", [])
-            # After format selection, requested_formats contains the chosen streams
-            requested = info.get("requested_formats") or []
-
-            video_url = None
-            audio_url = None
-            video_ext = "mp4"
-            audio_ext = "m4a"
-            video_height = info.get("height") or 0
-
-            if requested:
-                for f in requested:
-                    if f.get("vcodec") != "none" and f.get("acodec") == "none":
-                        video_url = f.get("url")
-                        video_ext = f.get("ext", "mp4")
-                        video_height = f.get("height") or video_height
-                    elif f.get("vcodec") == "none" and f.get("acodec") != "none":
-                        audio_url = f.get("url")
-                        audio_ext = f.get("ext", "m4a")
-                    elif f.get("vcodec") != "none" and f.get("acodec") != "none":
-                        # Muxed — no merge needed
-                        video_url = f.get("url")
-                        video_ext = f.get("ext", "mp4")
-                        video_height = f.get("height") or video_height
-            else:
-                # Fallback: single format selected
-                video_url = info.get("url")
-                video_ext = info.get("ext", "mp4")
-                video_height = info.get("height") or 0
-
-            return {
-                "info": info,
-                "video_url": video_url,
-                "audio_url": audio_url,
-                "video_ext": video_ext,
-                "audio_ext": audio_ext,
-                "video_height": video_height,
-                "is_muxed": audio_url is None,
-            }
-
     # ── Public interface ────────────────────────────────────────────────────
 
     async def get_info(self, url: str) -> VideoInfo:
         """Fetch video metadata without downloading."""
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, self._extract_info, url)
-        return self._parse_info(info, url)
+        data = await loop.run_in_executor(None, _fetch_prexzy, url)
+        return self._parse_info(data, url)
 
-    def _parse_info(self, info: dict, url: str) -> VideoInfo:
-        if "entries" in info:
-            info = next(iter(info["entries"]))
-        formats = info.get("formats", [])
-        best = None
-        for f in reversed(formats):
-            if f.get("vcodec") != "none":
-                best = f
-                break
+    def _parse_info(self, data: dict, url: str) -> VideoInfo:
+        medias = data.get("medias", [])
+        title = data.get("title", "Unknown")
+
+        # Find best video height
+        best_height = 0
+        for m in medias:
+            if m.get("type") == "video":
+                h = _parse_height(m.get("quality", ""))
+                if h > best_height:
+                    best_height = h
+
+        # Build thumbnail URL from video ID
+        video_id = _extract_video_id(url)
+        thumbnail_url = (
+            f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg"
+            if video_id else ""
+        )
+
         return VideoInfo(
-            title=info.get("title", "Unknown"),
+            title=title,
             url=url,
-            duration=int(info.get("duration") or 0),
-            width=int(info.get("width") or (best.get("width") if best else 0) or 0),
-            height=int(info.get("height") or (best.get("height") if best else 0) or 0),
-            ext=info.get("ext", "mp4"),
-            filesize=int(info.get("filesize") or info.get("filesize_approx") or 0),
-            thumbnail_url=info.get("thumbnail", ""),
-            uploader=info.get("uploader", ""),
-            view_count=int(info.get("view_count") or 0),
-            description=info.get("description", "")[:500],
+            duration=0,          # prexzy doesn't return duration
+            width=0,             # prexzy doesn't return width
+            height=best_height,
+            ext="mp4",
+            filesize=0,          # prexzy doesn't return filesize
+            thumbnail_url=thumbnail_url,
+            uploader="",
+            view_count=0,
+            description="",
         )
 
     async def get_available_qualities(self, url: str) -> List[Dict]:
         """List available quality options for a video."""
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, self._extract_info, url)
-        formats = info.get("formats", [])
+        data = await loop.run_in_executor(None, _fetch_prexzy, url)
+        medias = data.get("medias", [])
+
         seen = set()
         result = []
-        for f in reversed(formats):
-            h = f.get("height")
-            if not h:
+        for m in medias:
+            if m.get("type") != "video":
                 continue
-            label = f"{h}p"
-            if label in seen:
+            h = _parse_height(m.get("quality", ""))
+            if not h or h in seen:
                 continue
-            seen.add(label)
+            seen.add(h)
             result.append({
-                "quality": label,
-                "width": f.get("width"),
+                "quality": f"{h}p",
+                "width": None,
                 "height": h,
-                "fps": f.get("fps"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
-                "format_id": f.get("format_id"),
+                "fps": None,
+                "filesize": None,
             })
+
         return sorted(result, key=lambda x: x["height"], reverse=True)
 
     async def download(
@@ -269,60 +261,73 @@ class YouTubeDownloader:
         """
         Download a video.
 
-        1. Uses yt-dlp (js_runtimes/node) to extract direct stream URLs
-        2. Streams the file(s) via aiohttp
-        3. If separate video+audio streams, merges with ffmpeg
+        1. Calls prexzy API to get direct stream URLs
+        2. Streams file(s) via aiohttp
+        3. If separate video+audio, merges with ffmpeg
         """
         loop = asyncio.get_event_loop()
 
+        # Fetch media list from prexzy
+        data = await loop.run_in_executor(None, _fetch_prexzy, url)
+        info = self._parse_info(data, url)
+        medias = data.get("medias", [])
+
         if quality == "audio":
-            # Audio-only: use simple extraction
-            data = await loop.run_in_executor(None, self._get_direct_links, url)
-            info = self._parse_info(data["info"], url)
-            audio_fmt = data.get("best_audio")
-            if not audio_fmt:
-                raise ValueError("No audio stream available.")
-            out_path = self.download_dir / self._safe_name(info.title, "m4a")
-            await self._download_file(audio_fmt["url"], out_path, progress_callback, progress_args)
+            audio_entry = _select_audio(medias)
+            if not audio_entry:
+                raise ValueError("No audio stream available from prexzy.")
+            ext = "m4a" if audio_entry["quality"].startswith("m4a") else "opus"
+            out_path = self.download_dir / self._safe_name(info.title, ext)
+            await self._download_file(
+                audio_entry["url"], out_path, progress_callback, progress_args
+            )
             info.local_path = out_path
             info.filesize = out_path.stat().st_size
-            info.thumbnail_path = await self._download_thumbnail(info.thumbnail_url, info.title)
+            info.thumbnail_path = await self._download_thumbnail(
+                info.thumbnail_url, info.title
+            )
             return info
 
-        # For all other qualities use format-specific extraction
-        data = await loop.run_in_executor(
-            None, self._get_links_for_quality, url, quality
-        )
-        info = self._parse_info(data["info"], url)
-        info.height = data["video_height"]
-
-        video_url = data["video_url"]
-        audio_url = data["audio_url"]
-        is_muxed = data["is_muxed"]
-        video_ext = data["video_ext"]
-        audio_ext = data["audio_ext"]
-
-        if not video_url:
+        # Select video stream
+        video_entry = _select_video(medias, quality)
+        if not video_entry:
             raise ValueError(f"No video stream found for quality '{quality}'.")
 
-        if is_muxed:
-            # Single muxed file — download directly
+        info.height = video_entry["_height"]
+
+        video_url = video_entry["url"]
+        video_ext = "mp4" if video_entry["quality"].startswith("mp4") else "webm"
+
+        if _is_muxed(video_url):
+            # Muxed stream (itag=18, 360p) — download directly, no merge needed
+            logger.info(f"Muxed stream detected, downloading directly ({quality})")
             out_path = self.download_dir / self._safe_name(info.title, video_ext)
-            await self._download_file(video_url, out_path, progress_callback, progress_args)
+            await self._download_file(
+                video_url, out_path, progress_callback, progress_args
+            )
         else:
-            # Separate video + audio — download both, merge with ffmpeg
+            # Video-only stream — need to download audio separately and merge
+            audio_entry = _select_audio(medias)
+            if not audio_entry:
+                raise ValueError("No audio stream available for merging.")
+
+            audio_ext = "m4a" if audio_entry["quality"].startswith("m4a") else "opus"
             video_tmp = self.download_dir / self._safe_name(info.title + "_v", video_ext)
             audio_tmp = self.download_dir / self._safe_name(info.title + "_a", audio_ext)
             out_path = self.download_dir / self._safe_name(info.title, "mp4")
 
-            logger.info(f"Downloading video stream...")
-            await self._download_file(video_url, video_tmp, progress_callback, progress_args)
+            logger.info(f"Downloading video stream ({quality})...")
+            await self._download_file(
+                video_entry["url"], video_tmp, progress_callback, progress_args
+            )
 
             logger.info("Downloading audio stream...")
-            await self._download_file(audio_url, audio_tmp, None, ())
+            await self._download_file(audio_entry["url"], audio_tmp, None, ())
 
-            logger.info("Merging with ffmpeg...")
-            await loop.run_in_executor(None, self._ffmpeg_merge, video_tmp, audio_tmp, out_path)
+            logger.info("Merging video+audio with ffmpeg...")
+            await loop.run_in_executor(
+                None, self._ffmpeg_merge, video_tmp, audio_tmp, out_path
+            )
 
             for p in [video_tmp, audio_tmp]:
                 try:
@@ -332,7 +337,9 @@ class YouTubeDownloader:
 
         info.local_path = out_path
         info.filesize = out_path.stat().st_size if out_path.exists() else 0
-        info.thumbnail_path = await self._download_thumbnail(info.thumbnail_url, info.title)
+        info.thumbnail_path = await self._download_thumbnail(
+            info.thumbnail_url, info.title
+        )
 
         logger.info(f"Download complete: {out_path.name} ({info.filesize_mb:.1f} MB)")
         return info
@@ -348,7 +355,9 @@ class YouTubeDownloader:
     ):
         """Stream-download a URL to a local file with optional progress."""
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=3600)
+            ) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
@@ -358,7 +367,9 @@ class YouTubeDownloader:
                         downloaded += len(chunk)
                         if progress_callback:
                             if asyncio.iscoroutinefunction(progress_callback):
-                                await progress_callback(downloaded, total, *progress_args)
+                                await progress_callback(
+                                    downloaded, total, *progress_args
+                                )
                             else:
                                 progress_callback(downloaded, total, *progress_args)
 
@@ -377,14 +388,18 @@ class YouTubeDownloader:
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg merge failed:\n{result.stderr[-500:]}")
 
-    async def _download_thumbnail(self, thumb_url: str, title: str) -> Optional[Path]:
+    async def _download_thumbnail(
+        self, thumb_url: str, title: str
+    ) -> Optional[Path]:
         """Download video thumbnail for Telegram thumb parameter."""
         if not thumb_url:
             return None
         try:
             dest = self.download_dir / self._safe_name(title + "_thumb", "jpg")
             async with aiohttp.ClientSession() as session:
-                async with session.get(thumb_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(
+                    thumb_url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
                     if resp.status == 200:
                         with open(dest, "wb") as f:
                             f.write(await resp.read())

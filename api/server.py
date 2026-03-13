@@ -76,7 +76,7 @@ class UploadRequest(TelegramCreds):
 
     @validator("quality")
     def validate_quality(cls, v):
-        valid = ["best", "1080p", "720p", "480p", "360p", "144p", "worst", "audio"]
+        valid = ["best", "1080p", "720p", "480p", "360p", "240p", "144p", "worst", "audio"]
         if v not in valid:
             raise ValueError(f"quality must be one of: {', '.join(valid)}")
         return v
