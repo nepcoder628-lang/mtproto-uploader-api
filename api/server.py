@@ -8,7 +8,8 @@ hosted instance with their own api_id / api_hash / session_string.
 Endpoints:
     POST /auth/send-code  - Step 1: send OTP to phone
     POST /auth/verify     - Step 2: verify OTP → get session_string
-    POST /upload          - Download + upload to Telegram
+    POST /upload          - Download (via prexzy/yt) + upload to Telegram
+    POST /direct          - Download any direct URL + upload to Telegram
     POST /info            - Get video metadata (no download)
     POST /qualities       - List available qualities for a URL
     GET  /health          - Health check
@@ -21,6 +22,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -80,6 +82,17 @@ class UploadRequest(TelegramCreds):
         if v not in valid:
             raise ValueError(f"quality must be one of: {', '.join(valid)}")
         return v
+
+
+class DirectUploadRequest(TelegramCreds):
+    url: str = Field(..., description="Direct video/mp4 URL to download and upload")
+    chat_id: str = Field(..., description="Target Telegram chat ID or @username")
+    caption: Optional[str] = Field(None, description="Message caption")
+    reply_to_message_id: Optional[int] = Field(None)
+    bot_token: Optional[str] = Field(None)
+    status_chat_id: Optional[str] = Field(None)
+    status_message_id: Optional[int] = Field(None)
+    send_as_document: bool = Field(False)
 
 
 class InfoRequest(TelegramCreds):
@@ -243,6 +256,110 @@ async def get_qualities(req: QualitiesRequest):
             }
             for q in qualities
         ],
+    }
+
+
+@app.post("/direct")
+async def direct_upload(req: DirectUploadRequest):
+    """
+    Download any direct video/mp4 URL via aiohttp and upload to Telegram via MTProto.
+    No yt-dlp, no prexzy — just raw HTTP download + MTProto upload.
+
+    Example:
+        curl -X POST https://your-api.onrender.com/direct \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "api_id": 12345678,
+            "api_hash": "abc...",
+            "session_string": "BQA...",
+            "url": "https://example.com/video.mp4",
+            "chat_id": "123456789"
+          }'
+    """
+    import aiohttp as _aiohttp
+    import re as _re
+    import time as _time
+
+    download_dir = Path("/tmp/mtproto_downloads")
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive a safe filename from the URL
+    url_path = req.url.split("?")[0].rstrip("/")
+    raw_name = url_path.split("/")[-1] or "video"
+    safe_name = _re.sub(r'[^\w\-.]', '_', raw_name)[:80]
+    if not safe_name.endswith((".mp4", ".mkv", ".webm", ".mov", ".avi")):
+        safe_name += ".mp4"
+    local_path = download_dir / safe_name
+
+    # ── Download ────────────────────────────────────────────────────────────
+    dl_start = _time.time()
+    try:
+        async with _aiohttp.ClientSession() as session:
+            async with session.get(
+                req.url, timeout=_aiohttp.ClientTimeout(total=3600)
+            ) as resp:
+                resp.raise_for_status()
+                with open(local_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(256 * 1024):
+                        f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+
+    dl_duration = _time.time() - dl_start
+    filesize = local_path.stat().st_size
+
+    # ── Upload via MTProto ───────────────────────────────────────────────────
+    from core.uploader import MTProtoUploader
+
+    uploader = MTProtoUploader(
+        api_id=req.api_id,
+        api_hash=req.api_hash,
+        session_string=req.session_string,
+    )
+
+    ul_start = _time.time()
+    try:
+        await uploader.start()
+        caption = req.caption or safe_name
+
+        if req.send_as_document:
+            message = await uploader.send_document(
+                chat_id=_parse_chat_id(req.chat_id),
+                file_path=local_path,
+                caption=caption,
+                reply_to_message_id=req.reply_to_message_id,
+            )
+        else:
+            message = await uploader.send_video(
+                chat_id=_parse_chat_id(req.chat_id),
+                video_path=local_path,
+                caption=caption,
+                supports_streaming=True,
+                reply_to_message_id=req.reply_to_message_id,
+            )
+    except Exception as e:
+        logger.exception("MTProto upload failed")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+    finally:
+        await uploader.stop()
+        try:
+            local_path.unlink()
+        except Exception:
+            pass
+
+    ul_duration = _time.time() - ul_start
+    total = dl_duration + ul_duration
+
+    return {
+        "success": True,
+        "message_id": message.id,
+        "chat_id": str(req.chat_id),
+        "filename": safe_name,
+        "filesize_mb": round(filesize / 1_000_000, 2),
+        "download_seconds": round(dl_duration, 1),
+        "upload_seconds": round(ul_duration, 1),
+        "total_seconds": round(total, 1),
+        "speed_mbps": round((filesize / 1_000_000) / total if total else 0, 2),
     }
 
 
