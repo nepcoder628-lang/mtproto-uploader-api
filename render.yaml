@@ -7,19 +7,5 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn mtproto_uploader.api.server:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: API_ID
-        sync: false
-      - key: API_HASH
-        sync: false
-      - key: SESSION_STRING
-        sync: false
-      - key: BOT_TOKEN
-        sync: false
-      - key: DOWNLOAD_DIR
-        value: /tmp/mtproto_downloads
-      - key: MAX_FILESIZE_MB
-        value: "2000"
-      - key: HOST
-        value: "0.0.0.0"
       - key: PYTHONUNBUFFERED
         value: "1"
