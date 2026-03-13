@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-# ── Lifespan (nothing to do — fully stateless) ─────────────────────────────
+# ── Lifespan (stateless — nothing to initialise) ────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -66,7 +66,7 @@ class TelegramCreds(BaseModel):
 class UploadRequest(TelegramCreds):
     url: str = Field(..., description="Video URL (YouTube, TikTok, etc.)")
     chat_id: str = Field(..., description="Target Telegram chat ID or @username")
-    quality: str = Field("720p", description="best / 1080p / 720p / 480p / 360p / worst / audio")
+    quality: str = Field("720p", description="best / 1080p / 720p / 360p / 144p / audio")
     caption: Optional[str] = Field(None, description="Message caption. Defaults to video title.")
     reply_to_message_id: Optional[int] = Field(None)
     bot_token: Optional[str] = Field(None, description="Bot token for live progress message edits")
@@ -76,7 +76,7 @@ class UploadRequest(TelegramCreds):
 
     @validator("quality")
     def validate_quality(cls, v):
-        valid = ["best", "1080p", "720p", "480p", "360p", "worst", "audio"]
+        valid = ["best", "1080p", "720p", "480p", "360p", "144p", "worst", "audio"]
         if v not in valid:
             raise ValueError(f"quality must be one of: {', '.join(valid)}")
         return v
@@ -107,6 +107,10 @@ def _make_pipeline(creds: TelegramCreds) -> VideoUploadPipeline:
         max_filesize_mb=2000,
         auto_cleanup=True,
     )
+
+
+def _make_downloader() -> YouTubeDownloader:
+    return YouTubeDownloader(download_dir="/tmp/mtproto_downloads")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
