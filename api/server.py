@@ -293,6 +293,13 @@ async def direct_upload(req: DirectUploadRequest):
 
     # ── Download ────────────────────────────────────────────────────────────
     dl_start = _time.time()
+
+    # Extract origin (scheme + host) for Referer — many CDNs require Referer
+    # to match the file's own domain (hotlink protection).
+    from urllib.parse import urlparse as _urlparse
+    _parsed = _urlparse(req.url)
+    _origin = f"{_parsed.scheme}://{_parsed.netloc}"
+
     _headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -301,7 +308,13 @@ async def direct_upload(req: DirectUploadRequest):
         ),
         "Accept": "video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": req.url,
+        "Accept-Encoding": "identity",   # avoid compressed responses for binary files
+        "Referer": _origin + "/",        # domain root — satisfies hotlink checks
+        "Origin": _origin,
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "same-origin",
     }
     try:
         async with _aiohttp.ClientSession(headers=_headers) as session:
@@ -310,10 +323,44 @@ async def direct_upload(req: DirectUploadRequest):
                 timeout=_aiohttp.ClientTimeout(total=3600),
                 allow_redirects=True,
             ) as resp:
-                resp.raise_for_status()
-                with open(local_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(256 * 1024):
-                        f.write(chunk)
+                if resp.status == 403:
+                    # Some hosts block even with correct Referer from server IPs.
+                    # Try again without Referer/Origin as last resort.
+                    pass
+                else:
+                    resp.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(256 * 1024):
+                            f.write(chunk)
+
+        # If 403, retry without hotlink headers (some servers block Origin header)
+        if resp.status == 403:
+            _bare_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+            }
+            async with _aiohttp.ClientSession(headers=_bare_headers) as session2:
+                async with session2.get(
+                    req.url,
+                    timeout=_aiohttp.ClientTimeout(total=3600),
+                    allow_redirects=True,
+                ) as resp2:
+                    resp2.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        async for chunk in resp2.content.iter_chunked(256 * 1024):
+                            f.write(chunk)
+
+    except _aiohttp.ClientResponseError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Download failed ({e.status}): server rejected the request. "
+                   f"The URL may require authentication or block server IPs."
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {e}")
 
