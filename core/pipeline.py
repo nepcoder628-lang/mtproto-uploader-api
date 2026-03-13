@@ -35,8 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from .downloader import YouTubeDownloader, VideoInfo
-from .uploader import MTProtoUploader, UploadProgress
+from core.downloader import YouTubeDownloader, VideoInfo
+from core.uploader import MTProtoUploader, UploadProgress
 
 logger = logging.getLogger(__name__)
 

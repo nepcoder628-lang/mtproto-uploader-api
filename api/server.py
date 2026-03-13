@@ -26,10 +26,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 
-from ..core.downloader import YouTubeDownloader, VideoInfo
-from ..core.uploader import MTProtoUploader
-from ..core.pipeline import VideoUploadPipeline, PipelineResult
-from .auth import router as auth_router
+from core.downloader import YouTubeDownloader, VideoInfo
+from core.pipeline import VideoUploadPipeline, PipelineResult
+from api.auth import router as auth_router
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
