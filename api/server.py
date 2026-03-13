@@ -6,11 +6,13 @@ A FastAPI server that exposes the MTProto upload pipeline as HTTP endpoints.
 Any bot in any language can call this API to upload videos via MTProto.
 
 Endpoints:
-    POST /upload        - Download URL + upload to Telegram
-    GET  /info          - Get video info (no download)
-    GET  /qualities     - List available qualities for a URL
-    GET  /session       - Export current session string
-    GET  /health        - Health check
+    POST /auth/send-code  - Step 1: send OTP to phone number
+    POST /auth/verify     - Step 2: verify OTP → get session string
+    POST /upload          - Download URL + upload to Telegram
+    GET  /info            - Get video info (no download)
+    GET  /qualities       - List available qualities for a URL
+    GET  /session         - Export current session string
+    GET  /health          - Health check
 
 Start the server:
     uvicorn mtproto_uploader.api.server:app --host 0.0.0.0 --port 8080
@@ -30,6 +32,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 
 from ..core.pipeline import VideoUploadPipeline, PipelineResult
+from .auth import router as auth_router
 
 logger = logging.getLogger(__name__)
 
@@ -55,31 +58,36 @@ async def lifespan(app: FastAPI):
     """Start/stop the MTProto client with the FastAPI app lifecycle."""
     global _pipeline
 
-    # Auto-initialize from environment variables if not already set
+    # Auto-initialize from environment variables if not already set.
+    # If API_ID/API_HASH are missing, skip pipeline init — the server still
+    # starts so /auth/* endpoints are available for generating a session.
     if _pipeline is None:
         api_id = os.environ.get("API_ID")
         api_hash = os.environ.get("API_HASH")
-        if not api_id or not api_hash:
-            raise RuntimeError(
-                "API_ID and API_HASH environment variables are required. "
-                "Get them from https://my.telegram.org"
+        if api_id and api_hash:
+            from ..core.pipeline import VideoUploadPipeline
+            _pipeline = VideoUploadPipeline(
+                api_id=int(api_id),
+                api_hash=api_hash,
+                session_string=os.environ.get("SESSION_STRING"),
+                phone_number=os.environ.get("PHONE_NUMBER"),
+                bot_token=os.environ.get("BOT_TOKEN"),
+                download_dir=os.environ.get("DOWNLOAD_DIR", "/tmp/mtproto_downloads"),
+                max_filesize_mb=int(os.environ.get("MAX_FILESIZE_MB", "2000")),
             )
-        from ..core.pipeline import VideoUploadPipeline
-        _pipeline = VideoUploadPipeline(
-            api_id=int(api_id),
-            api_hash=api_hash,
-            session_string=os.environ.get("SESSION_STRING"),
-            phone_number=os.environ.get("PHONE_NUMBER"),
-            bot_token=os.environ.get("BOT_TOKEN"),
-            download_dir=os.environ.get("DOWNLOAD_DIR", "/tmp/mtproto_downloads"),
-            max_filesize_mb=int(os.environ.get("MAX_FILESIZE_MB", "2000")),
-        )
+            await _pipeline.start()
+            logger.info("MTProto pipeline started.")
+        else:
+            logger.warning(
+                "API_ID/API_HASH not set — upload endpoints disabled. "
+                "Use POST /auth/send-code + /auth/verify to generate a SESSION_STRING first."
+            )
 
-    await _pipeline.start()
-    logger.info("MTProto pipeline started.")
     yield
-    await _pipeline.stop()
-    logger.info("MTProto pipeline stopped.")
+
+    if _pipeline is not None:
+        await _pipeline.stop()
+        logger.info("MTProto pipeline stopped.")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────
@@ -87,11 +95,14 @@ app = FastAPI(
     title="MTProto Uploader API",
     description=(
         "Upload videos to Telegram via MTProto (up to 2GB/4GB). "
-        "Integrate with any bot framework using simple HTTP calls."
+        "Integrate with any bot framework using simple HTTP calls. "
+        "Use /auth/send-code + /auth/verify to generate a session string."
     ),
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(auth_router)
 
 
 # ── Request / Response models ──────────────────────────────────────────────
