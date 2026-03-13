@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mtproto-uploader"
+version = "1.0.0"
+description = "Upload videos to Telegram via MTProto (up to 2GB/4GB). Integrates with any Python bot framework."
+requires-python = ">=3.10"
+dependencies = [
+    "pyrogram==2.0.106",
+    "TgCrypto",
+    "yt-dlp",
+    "aiohttp>=3.9.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110.0", "uvicorn[standard]>=0.29.0", "pydantic>=2.0.0"]
+ptb = ["python-telegram-bot>=20.0"]
+telebot = ["pyTelegramBotAPI>=4.0"]
+aiogram = ["aiogram>=3.0"]
+all = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.0.0",
+    "python-telegram-bot>=20.0",
+    "pyTelegramBotAPI>=4.0",
+    "aiogram>=3.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+mtproto-uploader = "mtproto_uploader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mtproto_uploader*"]
