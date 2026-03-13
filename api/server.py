@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field, validator
 
 from core.downloader import YouTubeDownloader, VideoInfo
@@ -416,6 +416,99 @@ async def direct_upload(req: DirectUploadRequest):
         "filename": safe_name,
         "filesize_mb": round(filesize / 1_000_000, 2),
         "download_seconds": round(dl_duration, 1),
+        "upload_seconds": round(ul_duration, 1),
+        "total_seconds": round(total, 1),
+        "speed_mbps": round((filesize / 1_000_000) / total if total else 0, 2),
+    }
+
+
+@app.post("/upload-file")
+async def upload_file(
+    file: UploadFile = File(...),
+    api_id: int = Form(...),
+    api_hash: str = Form(...),
+    session_string: str = Form(...),
+    chat_id: str = Form(...),
+    caption: Optional[str] = Form(None),
+    send_as_document: bool = Form(False),
+):
+    """
+    Accept a file uploaded directly (multipart/form-data) and send it
+    to Telegram via MTProto. The bot downloads the file locally and
+    posts it here — bypasses any server-IP blocks on the source URL.
+    """
+    import time as _time
+    import re as _re
+
+    download_dir = Path("/tmp/mtproto_downloads")
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = _re.sub(r'[^\w\-.]', '_', file.filename or "video")[:80]
+    if not safe_name.endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")):
+        safe_name += ".mp4"
+    local_path = download_dir / safe_name
+
+    # Write uploaded bytes to disk
+    dl_start = _time.time()
+    try:
+        with open(local_path, "wb") as f:
+            while True:
+                chunk = await file.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"File receive failed: {e}")
+
+    dl_duration = _time.time() - dl_start
+    filesize = local_path.stat().st_size
+
+    # Upload via MTProto
+    from core.uploader import MTProtoUploader
+    uploader = MTProtoUploader(
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session_string,
+    )
+
+    ul_start = _time.time()
+    try:
+        await uploader.start()
+        final_caption = caption or safe_name
+
+        if send_as_document:
+            message = await uploader.send_document(
+                chat_id=_parse_chat_id(chat_id),
+                file_path=local_path,
+                caption=final_caption,
+            )
+        else:
+            message = await uploader.send_video(
+                chat_id=_parse_chat_id(chat_id),
+                video_path=local_path,
+                caption=final_caption,
+                supports_streaming=True,
+            )
+    except Exception as e:
+        logger.exception("MTProto upload failed")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+    finally:
+        await uploader.stop()
+        try:
+            local_path.unlink()
+        except Exception:
+            pass
+
+    ul_duration = _time.time() - ul_start
+    total = dl_duration + ul_duration
+
+    return {
+        "success": True,
+        "message_id": message.id,
+        "chat_id": str(chat_id),
+        "filename": safe_name,
+        "filesize_mb": round(filesize / 1_000_000, 2),
+        "receive_seconds": round(dl_duration, 1),
         "upload_seconds": round(ul_duration, 1),
         "total_seconds": round(total, 1),
         "speed_mbps": round((filesize / 1_000_000) / total if total else 0, 2),
